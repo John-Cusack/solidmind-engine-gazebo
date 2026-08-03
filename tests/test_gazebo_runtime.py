@@ -11,6 +11,8 @@ from gazebo_bridge.runtime_gazebo import (
     GazeboRuntimeError,
     RealGazeboRuntime,
     StubGazeboRuntime,
+    _angular_speeds_rpm,
+    _parse_pose_message,
     create_runtime,
 )
 
@@ -151,9 +153,97 @@ class TestRealRuntime(unittest.TestCase):
         self.assertEqual(sim["summary"]["engine_mode"], "gazebo_real")
         self.assertTrue(any("/world/default/control" in " ".join(c) for c in self.calls))
 
+    def test_real_simulate_reports_nothing_it_did_not_measure(self) -> None:
+        """Regression: a real run must not return the stub's invented numbers.
+
+        ``RealGazeboRuntime.handle_simulate`` used to delegate to the stub and
+        relabel the summary ``gazebo_real``, so every part came back at 120 rpm
+        and every joint at 5 N.m whatever the world did.  Core cannot tell an
+        invented number from a measured one, so the only safe answer when a
+        quantity was not read back is to leave the field out.
+
+        This runner answers the pose topic with an error, so nothing is
+        measurable and nothing may be reported.
+        """
+        with patch("gazebo_bridge.runtime_gazebo.shutil.which", return_value="/usr/bin/gz"):
+            runtime = RealGazeboRuntime(world_name="default", command_runner=self.runner)
+
+        sim = runtime.handle_simulate(
+            {
+                "duration_s": 0.2,
+                "dt_s": 0.02,
+                "output_interval": 0.1,
+                "sdf_path": self.model_path,
+                "mechanism": {
+                    "parts": [{"id": "frame"}, {"id": "gear_a"}],
+                    "joints": [{"id": "rev_a"}],
+                },
+            }
+        )
+        summary = sim["summary"]
+        self.assertNotIn("steady_state_speeds", summary)
+        self.assertNotIn("peak_joint_forces", summary)
+        for entry in sim["time_series"]:
+            self.assertEqual(entry["parts"], {})
+            self.assertNotIn("joint_efforts", entry)
+
+    def test_real_simulate_reports_measured_poses(self) -> None:
+        """With the pose topic answering, the series is what the world said."""
+        pose_frames = [
+            'pose {\n  name: "gear_a"\n  position {\n    z: 0.5\n  }\n'
+            "  orientation {\n    w: 1\n  }\n}\n",
+            # 45 degrees about z over one 0.1 s sample: 7.854 rad/s = 75 rpm.
+            'pose {\n  name: "gear_a"\n  position {\n    z: 0.5\n  }\n'
+            "  orientation {\n    z: 0.3826834\n    w: 0.9238795\n  }\n}\n",
+        ]
+
+        reads = iter(pose_frames)
+
+        def _runner(cmd: list[str]) -> tuple[int, str, str]:
+            if "dynamic_pose/info" in " ".join(cmd):
+                return 0, next(reads, pose_frames[-1]), ""
+            return self.runner(cmd)
+
+        with patch("gazebo_bridge.runtime_gazebo.shutil.which", return_value="/usr/bin/gz"):
+            runtime = RealGazeboRuntime(world_name="default", command_runner=_runner)
+
+        sim = runtime.handle_simulate(
+            {"duration_s": 0.1, "dt_s": 0.01, "output_interval": 0.1, "sdf_path": self.model_path}
+        )
+        self.assertIn("gear_a", sim["time_series"][-1]["parts"])
+        self.assertAlmostEqual(sim["summary"]["steady_state_speeds"]["gear_a"], 75.0, places=3)
+
     def test_diagnose_reports_worlds(self) -> None:
         with patch("gazebo_bridge.runtime_gazebo.shutil.which", return_value="/usr/bin/gz"):
             runtime = RealGazeboRuntime(world_name="default", command_runner=self.runner)
         diag = runtime.handle_diagnose({})
         self.assertTrue(diag["connected"])
         self.assertIn("default", diag["worlds"])
+
+
+class TestPoseReadback(unittest.TestCase):
+    """Parsing ``gz topic -e`` output — protobuf text with zeros omitted."""
+
+    def test_omitted_components_default_to_zero_and_identity(self) -> None:
+        text = (
+            "header {\n  stamp {\n    sec: 3\n  }\n}\n"
+            'pose {\n  name: "base"\n  id: 11\n  position {\n    z: 0.5\n  }\n'
+            "  orientation {\n    w: 1\n  }\n}\n"
+        )
+        poses = _parse_pose_message(text)
+        self.assertEqual(poses["base"]["pos_m"], [0.0, 0.0, 0.5])
+        self.assertEqual(poses["base"]["quat_wxyz"], [1.0, 0.0, 0.0, 0.0])
+
+    def test_every_moving_link_is_returned(self) -> None:
+        text = "".join(
+            f'pose {{\n  name: "{name}"\n  position {{\n    x: {x}\n  }}\n}}\n'
+            for name, x in (("a", 1.0), ("b", 2.0))
+        )
+        self.assertEqual(sorted(_parse_pose_message(text)), ["a", "b"])
+
+    def test_a_still_body_reports_zero_speed(self) -> None:
+        pose = {"link": {"pos_m": [0.0, 0.0, 0.0], "quat_wxyz": [1.0, 0.0, 0.0, 0.0]}}
+        self.assertEqual(_angular_speeds_rpm([(0.0, pose), (0.1, pose)], 0.1), {"link": 0.0})
+
+    def test_a_single_sample_yields_no_speeds(self) -> None:
+        self.assertEqual(_angular_speeds_rpm([(0.0, {})], 0.1), {})

@@ -8,6 +8,7 @@ Supports two runtime modes:
 from __future__ import annotations
 
 import logging
+import math
 import os
 import secrets
 import shutil
@@ -42,6 +43,77 @@ class _SupportsRun(Protocol):
 def _default_runner(cmd: list[str]) -> tuple[int, str, str]:
     proc = subprocess.run(cmd, check=False, capture_output=True, text=True)
     return proc.returncode, proc.stdout or "", proc.stderr or ""
+
+
+def _parse_pose_message(text: str) -> dict[str, dict[str, Any]]:
+    """Read ``gz topic -e`` text output into ``{link: {pos_m, quat_wxyz}}``.
+
+    The CLI prints protobuf text format, and it omits zero-valued fields —
+    a link at the origin prints ``position {}``, not three zeros — so every
+    component defaults to 0.0 and the quaternion defaults to identity.
+    """
+    poses: dict[str, dict[str, Any]] = {}
+    name: str | None = None
+    position = [0.0, 0.0, 0.0]
+    quat = [1.0, 0.0, 0.0, 0.0]
+    block: str | None = None
+    _AXES = {"x": 0, "y": 1, "z": 2}
+
+    def flush() -> None:
+        if name is not None:
+            poses[name] = {"pos_m": list(position), "quat_wxyz": list(quat)}
+
+    for raw in text.splitlines():
+        line = raw.strip()
+        if line.startswith("pose {"):
+            flush()
+            name, block = None, None
+            position, quat = [0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0]
+        elif line.startswith("position {"):
+            block = "position"
+        elif line.startswith("orientation {"):
+            block = "orientation"
+        elif line == "}":
+            block = None
+        elif line.startswith("name:"):
+            name = line.split(":", 1)[1].strip().strip('"')
+        elif ":" in line and block:
+            key, _, value = line.partition(":")
+            key = key.strip()
+            try:
+                number = float(value.strip())
+            except ValueError:
+                continue
+            if block == "position" and key in _AXES:
+                position[_AXES[key]] = number
+            elif block == "orientation":
+                quat[{"w": 0, "x": 1, "y": 2, "z": 3}.get(key, -1)] = number
+    flush()
+    return poses
+
+
+def _angular_speeds_rpm(
+    samples: list[tuple[float, dict[str, dict[str, Any]]]], sample_dt: float
+) -> dict[str, float]:
+    """Steady-state speed per link, from the rotation over the final interval.
+
+    The angle between two unit quaternions is ``2*acos(|q1.q2|)``; divided by
+    the elapsed time that is an angular speed, independent of the axis. Links
+    that do not appear in both of the last two samples are left out.
+    """
+    if len(samples) < 2 or sample_dt <= 0:
+        return {}
+    _, before = samples[-2]
+    _, after = samples[-1]
+    speeds: dict[str, float] = {}
+    for link, pose in after.items():
+        prior = before.get(link)
+        if prior is None:
+            continue
+        dot = abs(sum(a * b for a, b in zip(prior["quat_wxyz"], pose["quat_wxyz"], strict=True)))
+        angle_rad = 2.0 * math.acos(min(1.0, dot))
+        speeds[link] = round(angle_rad / sample_dt * 60.0 / (2.0 * math.pi), 6)
+    return speeds
 
 
 def _normalize_world_name(args: dict[str, Any], default: str) -> str:
@@ -518,7 +590,10 @@ class RealGazeboRuntime(StubGazeboRuntime):
             )
 
         # A package is the preferred input: compile it here, then spawn the
-        # SDF this bridge just produced.
+        # SDF this bridge just produced.  Compiling before the spawn is also
+        # how a malformed package surfaces as PACKAGE_INVALID rather than as
+        # a spawn failure.
+        compiled = compile_package(args)
         source_path = str(args.get("package_path", "")).strip()
         source_key = "package_path"
         if not source_path:
@@ -544,16 +619,81 @@ class RealGazeboRuntime(StubGazeboRuntime):
 
         duration_s = float(args.get("duration_s", 1.0))
         dt_s = float(args.get("dt_s", 0.01))
+        output_interval = float(args.get("output_interval", 0.05))
         world_name = _normalize_world_name(args, self._world_name)
-        steps = max(1, int(round(duration_s / max(dt_s, 1e-6))))
-        self._step_world(world_name=world_name, steps=steps)
 
-        result = super().handle_simulate(args)
-        summary = result.setdefault("summary", {})
-        summary["engine_mode"] = "gazebo_real"
+        # Step in output_interval-sized chunks and read the world back after
+        # each one.  Everything reported below is measured from that readback.
+        #
+        # This used to delegate to the stub's handle_simulate and relabel the
+        # summary "gazebo_real" — so a real run returned the stub's synthetic
+        # ramp (120 rpm for every part, 5 N.m for every joint) with a label
+        # saying it came from Gazebo.  Fabricating results under runtime_mode
+        # "real" is the one thing the contract cannot tolerate: core has no
+        # way to tell an invented number from a measured one.
+        stride = max(1, int(round(max(output_interval, dt_s) / max(dt_s, 1e-6))))
+        total_steps = max(1, int(round(duration_s / max(dt_s, 1e-6))))
+        sample_dt = stride * dt_s
+
+        samples: list[tuple[float, dict[str, dict[str, Any]]]] = [
+            (0.0, self._read_link_poses(world_name))
+        ]
+        stepped = 0
+        while stepped < total_steps:
+            chunk = min(stride, total_steps - stepped)
+            self._step_world(world_name=world_name, steps=chunk)
+            stepped += chunk
+            samples.append((round(stepped * dt_s, 6), self._read_link_poses(world_name)))
+
+        time_series = [{"t": t, "parts": poses} for t, poses in samples]
+
+        summary: dict[str, Any] = {
+            "simulation_time_s": round(stepped * dt_s, 6),
+            "dt_s": dt_s,
+            "output_interval": output_interval,
+            "engine_mode": "gazebo_real",
+            "world_name": world_name,
+        }
+        # Only report speeds we actually observed.  An engine that omits a
+        # field is telling the truth; one that invents it is not.
+        speeds = _angular_speeds_rpm(samples, sample_dt)
+        if speeds:
+            summary["steady_state_speeds"] = speeds
+        if compiled is not None:
+            summary["sdf_path"] = compiled["sdf_path"]
+            summary["model_name"] = compiled["model_name"]
+            if compiled["findings"]:
+                summary["sdf_validation"] = compiled["findings"]
         if spawned:
             summary["spawn"] = spawned
-        return result
+        return {"time_series": time_series, "summary": summary}
+
+    def _read_link_poses(self, world_name: str) -> dict[str, dict[str, Any]]:
+        """One sample of every moving link's pose, straight out of the world.
+
+        ``dynamic_pose/info`` is the pose topic Gazebo publishes for bodies
+        physics moves; static links never appear on it.  An empty dict means
+        nothing was moving, which is itself a truthful answer.
+        """
+        code, stdout, stderr = self._runner(
+            [
+                "gz",
+                "topic",
+                "-e",
+                "-t",
+                f"/world/{world_name}/dynamic_pose/info",
+                "-n",
+                "1",
+            ]
+        )
+        if code != 0:
+            logger.warning(
+                "Gazebo pose readback failed in world '%s': %s",
+                world_name,
+                (stderr or stdout).strip()[:200],
+            )
+            return {}
+        return _parse_pose_message(stdout)
 
     def _list_worlds(self) -> list[str]:
         code, stdout, stderr = self._runner(["gz", "service", "-l"])
