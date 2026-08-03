@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  tests:
+    name: Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[tck]"
+      - name: Unit tests
+        run: python -m unittest --verbose
+
+  conformance:
+    name: Contract conformance (TCK)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[tck]"
+      - name: Start the engine
+        run: |
+          python -m gazebo_bridge.bridge_server --port 9879 --runtime stub &
+          python - <<'READY'
+          import socket, sys, time
+          deadline = time.monotonic() + 30
+          while time.monotonic() < deadline:
+              try:
+                  socket.create_connection(("127.0.0.1", 9879), timeout=0.2).close()
+                  sys.exit(0)
+              except OSError:
+                  time.sleep(0.2)
+          sys.exit("engine did not start")
+          READY
+      - name: Run the TCK
+        run: python -m tck --port 9879
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: python -m pip install "ruff>=0.6,<1"
+      - run: ruff check .
+      - run: ruff format --check .

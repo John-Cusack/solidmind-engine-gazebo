@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "solidmind-engine-gazebo"
+version = "0.1.0"
+description = "Gazebo engine for SolidMind — package→SDF compilation, PX4 SITL, 5-DOF teleop."
+requires-python = ">=3.12"
+dependencies = []
+
+[project.optional-dependencies]
+# The conformance kit's schema tier is the only thing that needs a dependency.
+tck = ["jsonschema>=4.10,<5"]
+dev = ["ruff>=0.6,<1"]
+
+[tool.setuptools]
+packages = ["gazebo_bridge"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+ignore = ["E501"]
