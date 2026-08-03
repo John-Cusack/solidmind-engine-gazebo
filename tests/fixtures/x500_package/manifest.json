@@ -1,0 +1,365 @@
+{
+  "schema_version": "1.0.0",
+  "name": "x500_like",
+  "generator": "solidmind-cad",
+  "mode": "full",
+  "units": {
+    "length": "m",
+    "mass": "kg",
+    "angle": "rad"
+  },
+  "links": [
+    {
+      "name": "base_link",
+      "is_root": true,
+      "world_pose": {
+        "xyz_m": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "quat_wxyz": [
+          1.0,
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "mass_kg": 2.0,
+      "inertia": {
+        "ixx": 0.016666666666666666,
+        "ixy": 0.0,
+        "ixz": 0.0,
+        "iyy": 0.016666666666666666,
+        "iyz": 0.0,
+        "izz": 0.03
+      },
+      "collision": {
+        "kind": "box",
+        "size_m": [
+          0.3,
+          0.3,
+          0.1
+        ]
+      }
+    },
+    {
+      "name": "rotor_0",
+      "is_root": false,
+      "world_pose": {
+        "xyz_m": [
+          0.13,
+          -0.22,
+          0.06
+        ],
+        "quat_wxyz": [
+          1.0,
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "mass_kg": 0.016,
+      "inertia": {
+        "ixx": 4.003333333333334e-05,
+        "ixy": 0.0,
+        "ixz": 0.0,
+        "iyy": 4.003333333333334e-05,
+        "iyz": 0.0,
+        "izz": 8.000000000000002e-05
+      },
+      "collision": {
+        "kind": "cylinder",
+        "radius_m": 0.05,
+        "length_m": 0.005
+      }
+    },
+    {
+      "name": "rotor_1",
+      "is_root": false,
+      "world_pose": {
+        "xyz_m": [
+          -0.13,
+          0.2,
+          0.06
+        ],
+        "quat_wxyz": [
+          1.0,
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "mass_kg": 0.016,
+      "inertia": {
+        "ixx": 4.003333333333334e-05,
+        "ixy": 0.0,
+        "ixz": 0.0,
+        "iyy": 4.003333333333334e-05,
+        "iyz": 0.0,
+        "izz": 8.000000000000002e-05
+      },
+      "collision": {
+        "kind": "cylinder",
+        "radius_m": 0.05,
+        "length_m": 0.005
+      }
+    },
+    {
+      "name": "rotor_2",
+      "is_root": false,
+      "world_pose": {
+        "xyz_m": [
+          0.13,
+          0.22,
+          0.06
+        ],
+        "quat_wxyz": [
+          1.0,
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "mass_kg": 0.016,
+      "inertia": {
+        "ixx": 4.003333333333334e-05,
+        "ixy": 0.0,
+        "ixz": 0.0,
+        "iyy": 4.003333333333334e-05,
+        "iyz": 0.0,
+        "izz": 8.000000000000002e-05
+      },
+      "collision": {
+        "kind": "cylinder",
+        "radius_m": 0.05,
+        "length_m": 0.005
+      }
+    },
+    {
+      "name": "rotor_3",
+      "is_root": false,
+      "world_pose": {
+        "xyz_m": [
+          -0.13,
+          -0.2,
+          0.06
+        ],
+        "quat_wxyz": [
+          1.0,
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "mass_kg": 0.016,
+      "inertia": {
+        "ixx": 4.003333333333334e-05,
+        "ixy": 0.0,
+        "ixz": 0.0,
+        "iyy": 4.003333333333334e-05,
+        "iyz": 0.0,
+        "izz": 8.000000000000002e-05
+      },
+      "collision": {
+        "kind": "cylinder",
+        "radius_m": 0.05,
+        "length_m": 0.005
+      }
+    }
+  ],
+  "joints": [
+    {
+      "name": "rotor_0_joint",
+      "type": "continuous",
+      "parent": "base_link",
+      "child": "rotor_0",
+      "origin_xyz_m": [
+        0.13,
+        -0.22,
+        0.06
+      ],
+      "origin_rpy_rad": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "axis": [
+        0.0,
+        0.0,
+        1.0
+      ],
+      "effort": 100.0,
+      "velocity": 10.0,
+      "damping": 0.1,
+      "friction": 0.0
+    },
+    {
+      "name": "rotor_1_joint",
+      "type": "continuous",
+      "parent": "base_link",
+      "child": "rotor_1",
+      "origin_xyz_m": [
+        -0.13,
+        0.2,
+        0.06
+      ],
+      "origin_rpy_rad": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "axis": [
+        0.0,
+        0.0,
+        1.0
+      ],
+      "effort": 100.0,
+      "velocity": 10.0,
+      "damping": 0.1,
+      "friction": 0.0
+    },
+    {
+      "name": "rotor_2_joint",
+      "type": "continuous",
+      "parent": "base_link",
+      "child": "rotor_2",
+      "origin_xyz_m": [
+        0.13,
+        0.22,
+        0.06
+      ],
+      "origin_rpy_rad": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "axis": [
+        0.0,
+        0.0,
+        1.0
+      ],
+      "effort": 100.0,
+      "velocity": 10.0,
+      "damping": 0.1,
+      "friction": 0.0
+    },
+    {
+      "name": "rotor_3_joint",
+      "type": "continuous",
+      "parent": "base_link",
+      "child": "rotor_3",
+      "origin_xyz_m": [
+        -0.13,
+        -0.2,
+        0.06
+      ],
+      "origin_rpy_rad": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "axis": [
+        0.0,
+        0.0,
+        1.0
+      ],
+      "effort": 100.0,
+      "velocity": 10.0,
+      "damping": 0.1,
+      "friction": 0.0
+    }
+  ],
+  "actuators": [
+    {
+      "type": "rotor",
+      "name": "rotor_0",
+      "index": 0,
+      "joint": "rotor_0_joint",
+      "direction": "ccw",
+      "max_thrust_N": 8.54858,
+      "moment_constant": 0.016,
+      "motor_constant": 8.54858e-06,
+      "max_rot_velocity_rad_s": 1000.0,
+      "min_rot_velocity_rad_s": 150.0,
+      "link": "rotor_0",
+      "position_m": [
+        0.13,
+        -0.22,
+        0.06
+      ]
+    },
+    {
+      "type": "rotor",
+      "name": "rotor_1",
+      "index": 1,
+      "joint": "rotor_1_joint",
+      "direction": "ccw",
+      "max_thrust_N": 8.54858,
+      "moment_constant": 0.016,
+      "motor_constant": 8.54858e-06,
+      "max_rot_velocity_rad_s": 1000.0,
+      "min_rot_velocity_rad_s": 150.0,
+      "link": "rotor_1",
+      "position_m": [
+        -0.13,
+        0.2,
+        0.06
+      ]
+    },
+    {
+      "type": "rotor",
+      "name": "rotor_2",
+      "index": 2,
+      "joint": "rotor_2_joint",
+      "direction": "cw",
+      "max_thrust_N": 8.54858,
+      "moment_constant": 0.016,
+      "motor_constant": 8.54858e-06,
+      "max_rot_velocity_rad_s": 1000.0,
+      "min_rot_velocity_rad_s": 150.0,
+      "link": "rotor_2",
+      "position_m": [
+        0.13,
+        0.22,
+        0.06
+      ]
+    },
+    {
+      "type": "rotor",
+      "name": "rotor_3",
+      "index": 3,
+      "joint": "rotor_3_joint",
+      "direction": "cw",
+      "max_thrust_N": 8.54858,
+      "moment_constant": 0.016,
+      "motor_constant": 8.54858e-06,
+      "max_rot_velocity_rad_s": 1000.0,
+      "min_rot_velocity_rad_s": 150.0,
+      "link": "rotor_3",
+      "position_m": [
+        -0.13,
+        -0.2,
+        0.06
+      ]
+    }
+  ],
+  "sensors": [
+    {
+      "type": "imu",
+      "link": "base_link"
+    },
+    {
+      "type": "gps",
+      "link": "base_link"
+    },
+    {
+      "type": "barometer",
+      "link": "base_link"
+    },
+    {
+      "type": "magnetometer",
+      "link": "base_link"
+    }
+  ]
+}

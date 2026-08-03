@@ -15,6 +15,12 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 _PACKAGES = ("gazebo_bridge",)
 _FORBIDDEN = ("server",)
 
+#: The tests are scanned too.  They used to be the exception — modules that
+#: reached into core were quarantined under ``tests/needs_porting/`` and left
+#: out of discovery.  All of them are ported now, so the boundary holds for the
+#: whole repository and a re-coupled test fails here instead of being filed.
+_SCANNED = (*_PACKAGES, "tests")
+
 
 def _imported_roots(path: Path) -> set[tuple[str, int]]:
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
@@ -31,11 +37,13 @@ def _imported_roots(path: Path) -> set[tuple[str, int]]:
 class TestNoCoreImports(unittest.TestCase):
     def test_no_server_imports(self) -> None:
         violations: list[str] = []
-        for package in _PACKAGES:
+        for package in _SCANNED:
             for path in sorted((_REPO_ROOT / package).rglob("*.py")):
                 for root, lineno in _imported_roots(path):
                     if root in _FORBIDDEN:
-                        violations.append(f"{path.relative_to(_REPO_ROOT)}:{lineno} imports {root!r}")
+                        violations.append(
+                            f"{path.relative_to(_REPO_ROOT)}:{lineno} imports {root!r}"
+                        )
         self.assertEqual(
             violations,
             [],
@@ -44,8 +52,12 @@ class TestNoCoreImports(unittest.TestCase):
 
     def test_the_scan_saw_something(self) -> None:
         """Guard the guard — but a C++ package legitimately has no Python."""
-        scanned = [p for pkg in _PACKAGES for p in (_REPO_ROOT / pkg).rglob("*.py")]
-        self.assertTrue(scanned, f"no python files scanned in {_PACKAGES}")
+        scanned = [p for pkg in _SCANNED for p in (_REPO_ROOT / pkg).rglob("*.py")]
+        self.assertTrue(scanned, f"no python files scanned in {_SCANNED}")
+
+    def test_no_quarantine_directory_remains(self) -> None:
+        """``tests/needs_porting/`` was the split's IOU; it is paid off."""
+        self.assertFalse((_REPO_ROOT / "tests" / "needs_porting").exists())
 
 
 if __name__ == "__main__":
