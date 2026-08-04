@@ -280,6 +280,60 @@ class TestMavlinkControllerSetpointStream(unittest.TestCase):
         self.assertEqual(cm.exception.code, "NOT_CONNECTED")
 
 
+class TestMavlinkControllerGcsHeartbeat(unittest.TestCase):
+    """We must announce ourselves as a GCS or PX4 will not let us arm.
+
+    The airframes we generate set ``NAV_DLL_ACT 2``, which makes a GCS
+    connection a precondition for arming.  pymavlink does not send
+    heartbeats on its own, so a controller that only listens leaves PX4
+    reporting "Preflight Fail: No connection to the GCS" forever — which
+    is exactly what grounded the quadrotor example.
+    """
+
+    def setUp(self) -> None:
+        self.fake = _FakeConnection()
+        self.fake.inject_message(_FakeMessage("HEARTBEAT", {}))
+        self.ctrl = MavlinkController(connect_factory=_factory_for(self.fake))
+        # Bump rate so tests are quick.
+        self.ctrl._HEARTBEAT_RATE_HZ = 100.0  # noqa: SLF001
+
+    def tearDown(self) -> None:
+        self.ctrl.disconnect()
+
+    def test_connect_identifies_us_as_a_ground_station(self) -> None:
+        self.ctrl.connect(timeout_s=1.0)
+        time.sleep(0.1)
+        self.fake.mav.heartbeat_send.assert_called()
+        args = self.fake.mav.heartbeat_send.call_args.args
+        # (type, autopilot, base_mode, custom_mode, system_status)
+        self.assertEqual(args[0], 6, "must be MAV_TYPE_GCS")
+        self.assertEqual(args[1], 8, "must be MAV_AUTOPILOT_INVALID")
+        self.assertEqual(args[4], 4, "must be MAV_STATE_ACTIVE")
+
+    def test_heartbeat_streams_without_a_setpoint_stream(self) -> None:
+        """Arming happens before OFFBOARD, so this cannot depend on tx."""
+        self.ctrl.connect(timeout_s=1.0)
+        time.sleep(0.15)
+        self.assertGreater(self.fake.mav.heartbeat_send.call_count, 2)
+        # No setpoint stream was ever started.
+        self.fake.mav.set_position_target_local_ned_send.assert_not_called()
+
+    def test_disconnect_stops_the_heartbeat(self) -> None:
+        self.ctrl.connect(timeout_s=1.0)
+        time.sleep(0.1)
+        self.ctrl.disconnect()
+        settled = self.fake.mav.heartbeat_send.call_count
+        time.sleep(0.15)
+        self.assertEqual(self.fake.mav.heartbeat_send.call_count, settled)
+
+    def test_send_failure_does_not_kill_the_loop(self) -> None:
+        """A dropped heartbeat is recoverable; the loop must survive it."""
+        self.fake.mav.heartbeat_send.side_effect = [OSError("transient")] + [None] * 100
+        self.ctrl.connect(timeout_s=1.0)
+        time.sleep(0.15)
+        self.assertGreater(self.fake.mav.heartbeat_send.call_count, 2)
+
+
 class TestMavlinkControllerTelemetry(unittest.TestCase):
     def setUp(self) -> None:
         self.fake = _FakeConnection()
