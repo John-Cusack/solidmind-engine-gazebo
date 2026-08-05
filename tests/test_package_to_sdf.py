@@ -173,6 +173,32 @@ class TestStructure(_CompilerTestCase):
         self.assertAlmostEqual(float(chassis.findtext("inertial/mass")), 1.2)
         self.assertAlmostEqual(float(chassis.findtext("inertial/inertia/izz")), 0.02)
 
+    def test_massless_link_still_gets_an_inertial(self) -> None:
+        """A manifest link with no mass must not be left to SDF's defaults.
+
+        Omitting ``<inertial>`` means 1 kg and a unit inertia tensor, not zero.
+        A ground-clearance ``base_link`` that inherited those defaults added a
+        phantom body to every drone we exported — heavier than most of the
+        airframe and 60x its roll inertia — and tumbled it after takeoff.
+        """
+        manifest = _manifest()
+        manifest["links"].append(
+            {
+                "name": "base_link",
+                "world_pose": {"xyz_m": [0.0, 0.0, 0.0], "quat_wxyz": [1.0, 0.0, 0.0, 0.0]},
+            }
+        )
+        model = self.compile(manifest).find("model")
+        base = next(lk for lk in model.findall("link") if lk.get("name") == "base_link")
+
+        inertial = base.find("inertial")
+        self.assertIsNotNone(inertial, "massless link emitted with no <inertial>")
+        mass = float(inertial.findtext("mass"))
+        self.assertGreater(mass, 0.0)
+        self.assertLess(mass, 1e-3, "fell back to something that would perturb the airframe")
+        self.assertIsNotNone(inertial.find("inertia"))
+        self.assertGreater(float(inertial.findtext("inertia/ixx")), 0.0)
+
     def test_primitive_collision_gets_a_matching_visual(self) -> None:
         """A mesh-less link still renders — otherwise the drone is invisible."""
         model = self.compile().find("model")

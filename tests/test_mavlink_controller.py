@@ -186,6 +186,94 @@ class TestMavlinkControllerCommands(unittest.TestCase):
         self.assertEqual(args[5], 4.0)  # AUTO main mode
         self.assertEqual(args[6], 2.0)  # AUTO_TAKEOFF sub mode
 
+    def _param_value(self, name: str, value: float) -> None:
+        """Inject a PARAM_VALUE readback after a tiny delay."""
+
+        def deliver() -> None:
+            time.sleep(0.05)
+            self.fake.inject_message(
+                _FakeMessage("PARAM_VALUE", {"param_id": name, "param_value": value})
+            )
+
+        threading.Thread(target=deliver, daemon=True).start()
+
+    def _respond_to_sends(self, *, stored: float | None = None) -> None:
+        """Reply to PARAM_SET and COMMAND_LONG as they are sent.
+
+        A timer-based reply races any call that sends two messages in sequence:
+        the ACK for the second can land before its waiter is registered, and is
+        then dropped. Responding from the send itself removes the ordering
+        question entirely — the waiter is always registered before the send.
+        """
+
+        def on_param_set(_ts, _tc, name: bytes, value: float, _type: int) -> None:
+            self.fake.inject_message(
+                _FakeMessage(
+                    "PARAM_VALUE",
+                    {
+                        "param_id": name,
+                        "param_value": value if stored is None else stored,
+                    },
+                )
+            )
+
+        def on_command_long(_ts, _tc, command: int, *_args) -> None:
+            self.fake.inject_message(_FakeMessage("COMMAND_ACK", {"command": command, "result": 0}))
+
+        self.fake.mav.param_set_send.side_effect = on_param_set
+        self.fake.mav.command_long_send.side_effect = on_command_long
+
+    def test_set_param_returns_what_px4_actually_stored(self) -> None:
+        # PX4 may clamp or round; the readback is the truth, not the request.
+        self._param_value("MIS_TAKEOFF_ALT", 3.0)
+        stored = self.ctrl.set_param("MIS_TAKEOFF_ALT", 5.0, timeout_s=2.0)
+        self.assertEqual(stored, 3.0)
+        args = self.fake.mav.param_set_send.call_args.args
+        self.assertEqual(args[0], 1)  # target_system
+        self.assertEqual(args[2], b"MIS_TAKEOFF_ALT")
+        self.assertEqual(args[3], 5.0)
+
+    def test_set_param_matches_a_nul_padded_bytes_param_id(self) -> None:
+        """param_id is a char[16] — it can arrive as NUL-padded bytes."""
+
+        def deliver() -> None:
+            time.sleep(0.05)
+            self.fake.inject_message(
+                _FakeMessage(
+                    "PARAM_VALUE",
+                    {"param_id": b"MIS_TAKEOFF_ALT\x00", "param_value": 4.0},
+                )
+            )
+
+        threading.Thread(target=deliver, daemon=True).start()
+        self.assertEqual(self.ctrl.set_param("MIS_TAKEOFF_ALT", 4.0, timeout_s=2.0), 4.0)
+
+    def test_set_param_times_out_without_a_readback(self) -> None:
+        with self.assertRaises(MavlinkError) as cm:
+            self.ctrl.set_param("MIS_TAKEOFF_ALT", 5.0, timeout_s=0.1)
+        self.assertEqual(cm.exception.code, "PARAM_TIMEOUT")
+
+    def test_takeoff_altitude_is_applied_not_silently_dropped(self) -> None:
+        """AUTO_TAKEOFF has no altitude field — it reads MIS_TAKEOFF_ALT.
+
+        Without this, asking for 5 m climbs to PX4's 2.5 m default and the
+        pipeline's own altitude check is what discovers it.
+        """
+        self._respond_to_sends()
+        self.ctrl.takeoff_via_mode(altitude_m=5.0, timeout_s=2.0)
+
+        self.fake.mav.param_set_send.assert_called_once()
+        args = self.fake.mav.param_set_send.call_args.args
+        self.assertEqual(args[2], b"MIS_TAKEOFF_ALT")
+        self.assertEqual(args[3], 5.0)
+        # And the mode switch still happened, after the parameter.
+        self.assertEqual(self.fake.mav.command_long_send.call_args.args[2], 176)
+
+    def test_takeoff_without_an_altitude_sets_no_parameter(self) -> None:
+        self._ack(176)
+        self.ctrl.takeoff_via_mode(timeout_s=2.0)
+        self.fake.mav.param_set_send.assert_not_called()
+
     def test_land_via_mode_switches_to_auto_land(self) -> None:
         self._ack(176)
         self.ctrl.land_via_mode(timeout_s=2.0)
@@ -278,6 +366,60 @@ class TestMavlinkControllerSetpointStream(unittest.TestCase):
         with self.assertRaises(MavlinkError) as cm:
             ctrl.start_setpoint_stream()
         self.assertEqual(cm.exception.code, "NOT_CONNECTED")
+
+
+class TestMavlinkControllerGcsHeartbeat(unittest.TestCase):
+    """We must announce ourselves as a GCS or PX4 will not let us arm.
+
+    The airframes we generate set ``NAV_DLL_ACT 2``, which makes a GCS
+    connection a precondition for arming.  pymavlink does not send
+    heartbeats on its own, so a controller that only listens leaves PX4
+    reporting "Preflight Fail: No connection to the GCS" forever — which
+    is exactly what grounded the quadrotor example.
+    """
+
+    def setUp(self) -> None:
+        self.fake = _FakeConnection()
+        self.fake.inject_message(_FakeMessage("HEARTBEAT", {}))
+        self.ctrl = MavlinkController(connect_factory=_factory_for(self.fake))
+        # Bump rate so tests are quick.
+        self.ctrl._HEARTBEAT_RATE_HZ = 100.0  # noqa: SLF001
+
+    def tearDown(self) -> None:
+        self.ctrl.disconnect()
+
+    def test_connect_identifies_us_as_a_ground_station(self) -> None:
+        self.ctrl.connect(timeout_s=1.0)
+        time.sleep(0.1)
+        self.fake.mav.heartbeat_send.assert_called()
+        args = self.fake.mav.heartbeat_send.call_args.args
+        # (type, autopilot, base_mode, custom_mode, system_status)
+        self.assertEqual(args[0], 6, "must be MAV_TYPE_GCS")
+        self.assertEqual(args[1], 8, "must be MAV_AUTOPILOT_INVALID")
+        self.assertEqual(args[4], 4, "must be MAV_STATE_ACTIVE")
+
+    def test_heartbeat_streams_without_a_setpoint_stream(self) -> None:
+        """Arming happens before OFFBOARD, so this cannot depend on tx."""
+        self.ctrl.connect(timeout_s=1.0)
+        time.sleep(0.15)
+        self.assertGreater(self.fake.mav.heartbeat_send.call_count, 2)
+        # No setpoint stream was ever started.
+        self.fake.mav.set_position_target_local_ned_send.assert_not_called()
+
+    def test_disconnect_stops_the_heartbeat(self) -> None:
+        self.ctrl.connect(timeout_s=1.0)
+        time.sleep(0.1)
+        self.ctrl.disconnect()
+        settled = self.fake.mav.heartbeat_send.call_count
+        time.sleep(0.15)
+        self.assertEqual(self.fake.mav.heartbeat_send.call_count, settled)
+
+    def test_send_failure_does_not_kill_the_loop(self) -> None:
+        """A dropped heartbeat is recoverable; the loop must survive it."""
+        self.fake.mav.heartbeat_send.side_effect = [OSError("transient")] + [None] * 100
+        self.ctrl.connect(timeout_s=1.0)
+        time.sleep(0.15)
+        self.assertGreater(self.fake.mav.heartbeat_send.call_count, 2)
 
 
 class TestMavlinkControllerTelemetry(unittest.TestCase):

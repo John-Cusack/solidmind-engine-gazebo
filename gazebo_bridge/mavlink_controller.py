@@ -16,8 +16,10 @@ The threading model:
 
 - The constructor and ``connect()`` run on the caller thread.
 - ``connect()`` blocks until the first HEARTBEAT arrives, then starts
-  two daemon threads: a receive loop and (when a setpoint stream is
-  active) a setpoint publisher.
+  a receive loop and a heartbeat publisher (and, when a setpoint
+  stream is active, a setpoint publisher).
+- The heartbeat publisher is not optional: it is what identifies us to
+  PX4 as a ground station, and PX4 refuses to arm without one.
 - Every command method sends a ``COMMAND_LONG`` and synchronously
   waits for the matching ``COMMAND_ACK``.  The receive loop both
   feeds telemetry state and surfaces the ack via an event.
@@ -100,6 +102,14 @@ class MavlinkController:
     # 20 Hz gives generous headroom and aligns with stock PX4 demos.
     _SETPOINT_RATE_HZ = 20.0
 
+    # We are the ground station, so we must behave like one.  The airframes
+    # we generate set NAV_DLL_ACT 2 (data-link-loss -> land), which makes a
+    # GCS connection a *precondition for arming*: PX4's rcAndDataLinkCheck
+    # blocks every mode with "Preflight Fail: No connection to the GCS"
+    # until it has heard a heartbeat from a GCS.  1 Hz is the MAVLink
+    # convention and matches PX4's own staleness window.
+    _HEARTBEAT_RATE_HZ = 1.0
+
     def __init__(
         self,
         udp_url: str = "udp:127.0.0.1:14540",
@@ -127,9 +137,13 @@ class MavlinkController:
         self._stop_evt = threading.Event()
         self._rx_thread: threading.Thread | None = None
         self._tx_thread: threading.Thread | None = None
+        self._hb_thread: threading.Thread | None = None
 
         self._ack_events: dict[int, tuple[threading.Event, list[int]]] = {}
         self._ack_lock = threading.Lock()
+
+        self._param_events: dict[str, tuple[threading.Event, list[float]]] = {}
+        self._param_lock = threading.Lock()
 
     # ------------------------------------------------------------------
     # Connection lifecycle
@@ -183,14 +197,25 @@ class MavlinkController:
         )
         self._rx_thread.start()
 
+        # Must run for the whole session, not just during OFFBOARD: arming
+        # happens before any setpoint stream exists, and it is arming that
+        # PX4 gates on seeing a GCS.
+        self._hb_thread = threading.Thread(
+            target=self._hb_loop,
+            name="mavlink-heartbeat",
+            daemon=True,
+        )
+        self._hb_thread.start()
+
     def disconnect(self) -> None:
         """Stop streamers, close the MAVLink connection, join threads."""
         self._stop_evt.set()
-        for t in (self._tx_thread, self._rx_thread):
+        for t in (self._tx_thread, self._rx_thread, self._hb_thread):
             if t is not None and t.is_alive():
                 t.join(timeout=2.0)
         self._tx_thread = None
         self._rx_thread = None
+        self._hb_thread = None
 
         if self._conn is not None:
             try:
@@ -225,10 +250,16 @@ class MavlinkController:
     def arm(self, timeout_s: float = 5.0, *, force: bool = True) -> None:
         """Arm the autopilot.
 
-        Defaults to force-arm (param2=21196) which is required for PX4 v1.17
-        SITL because the RC sensor health bit lingers as "enabled but not
-        present" without a physical RC transmitter.  Set ``force=False``
-        for production hardware where you want the full preflight gate.
+        ``force`` sends the param2=21196 magic number, but do not rely on it
+        to bypass anything over MAVLink: ``Commander.cpp`` calls
+        ``arm(reason, cmd.from_external || !forced)``, and ``from_external``
+        is true for every command that arrives on a link — so an external
+        arm always runs the full preflight gate.  The magic number only
+        skips checks for internally-generated commands.
+
+        If arming is denied, read the reason from PX4 rather than guessing:
+        ``ulog_messages <newest>.ulg`` prints the ``health_and_arming_checks``
+        line that says which check failed.
         """
         self._send_command_long_and_wait(
             command=400,  # MAV_CMD_COMPONENT_ARM_DISARM
@@ -246,14 +277,21 @@ class MavlinkController:
             description="disarm",
         )
 
-    def takeoff_via_mode(self, timeout_s: float = 5.0) -> None:
+    def takeoff_via_mode(self, altitude_m: float | None = None, timeout_s: float = 5.0) -> None:
         """Trigger AUTO_TAKEOFF mode — same code path as ``commander takeoff``.
 
         PX4 v1.17 ignores the older MAV_CMD_NAV_TAKEOFF flow without first
         being switched to AUTO_TAKEOFF mode.  This helper does exactly that:
         ``DO_SET_MODE`` to (custom_main=4, custom_sub=2).  Vehicle must
         already be armed.
+
+        AUTO_TAKEOFF carries no altitude of its own — with no mission item to
+        read, PX4 climbs to ``MIS_TAKEOFF_ALT`` and logs "Using default takeoff
+        altitude: 2.50 m".  So ``altitude_m`` is applied by setting that
+        parameter first; without it, asking for 5 m silently gets you 2.5.
         """
+        if altitude_m is not None:
+            self.set_param("MIS_TAKEOFF_ALT", float(altitude_m), timeout_s=timeout_s)
         self._send_command_long_and_wait(
             command=176,  # MAV_CMD_DO_SET_MODE
             param1=1.0,  # MAV_MODE_FLAG_CUSTOM_MODE_ENABLED
@@ -262,6 +300,45 @@ class MavlinkController:
             timeout_s=timeout_s,
             description="set AUTO_TAKEOFF mode",
         )
+
+    def set_param(self, name: str, value: float, timeout_s: float = 5.0) -> float:
+        """Set a PX4 parameter and wait for the readback.
+
+        PARAM_SET is not acknowledged by COMMAND_ACK — PX4 replies with a
+        PARAM_VALUE carrying whatever it actually stored, which may differ from
+        what was asked (clamped to the parameter's range, or rounded for an
+        integer parameter).  Returning the stored value rather than the
+        requested one keeps callers honest about that.
+        """
+        if self._conn is None:
+            raise MavlinkError(
+                f"Cannot set {name!r} — not connected.",
+                code="NOT_CONNECTED",
+            )
+
+        event = threading.Event()
+        values: list[float] = []
+        with self._param_lock:
+            self._param_events[name] = (event, values)
+
+        try:
+            with self._mav_lock:
+                self._conn.mav.param_set_send(
+                    self._target_system,
+                    self._target_component,
+                    name.encode("ascii"),
+                    float(value),
+                    9,  # MAV_PARAM_TYPE_REAL32
+                )
+            if not event.wait(timeout=timeout_s):
+                raise MavlinkError(
+                    f"No PARAM_VALUE for {name!r} within {timeout_s}s",
+                    code="PARAM_TIMEOUT",
+                )
+            return values[0]
+        finally:
+            with self._param_lock:
+                self._param_events.pop(name, None)
 
     def land_via_mode(self, timeout_s: float = 5.0) -> None:
         """Trigger AUTO_LAND mode — same code path as ``commander land``."""
@@ -395,6 +472,21 @@ class MavlinkController:
                 )
             return
 
+        if msg_type == "PARAM_VALUE":
+            # pymavlink usually decodes param_id, but not always — a char[16]
+            # field can arrive as NUL-padded bytes.
+            raw = msg.param_id
+            name = (raw.decode("ascii", "replace") if isinstance(raw, bytes) else str(raw)).rstrip(
+                "\x00"
+            )
+            with self._param_lock:
+                entry = self._param_events.get(name)
+            if entry is not None:
+                event, values = entry
+                values.append(float(msg.param_value))
+                event.set()
+            return
+
         if msg_type == "COMMAND_ACK":
             with self._ack_lock:
                 entry = self._ack_events.get(int(msg.command))
@@ -412,6 +504,37 @@ class MavlinkController:
             self._telemetry.custom_mode = int(getattr(msg, "custom_mode", 0))
             self._telemetry.base_mode = int(getattr(msg, "base_mode", 0))
             self._telemetry.armed = armed
+
+    # ------------------------------------------------------------------
+    # Internal: heartbeat loop
+    # ------------------------------------------------------------------
+
+    def _hb_loop(self) -> None:
+        """Announce ourselves as a ground station once per second.
+
+        pymavlink does not emit heartbeats on its own — the application
+        has to.  Without this PX4 holds ``gcs_connection_lost``, and any
+        airframe with ``NAV_DLL_ACT > 0`` refuses to arm indefinitely.
+        Note that force-arm does not help: PX4 only honours the 21196
+        magic number for internally-generated commands, so a MAVLink arm
+        always runs the full preflight gate.
+        """
+        period = 1.0 / self._HEARTBEAT_RATE_HZ
+        while not self._stop_evt.is_set():
+            try:
+                with self._mav_lock:
+                    self._conn.mav.heartbeat_send(
+                        6,  # MAV_TYPE_GCS
+                        8,  # MAV_AUTOPILOT_INVALID — we are not an autopilot
+                        0,  # base_mode
+                        0,  # custom_mode
+                        4,  # MAV_STATE_ACTIVE
+                    )
+            except Exception as exc:  # noqa: BLE001
+                # A dropped heartbeat is recoverable; a dead connection is
+                # the rx loop's business to report.
+                logger.warning("MAVLink heartbeat send failed: %s", exc)
+            self._stop_evt.wait(period)
 
     # ------------------------------------------------------------------
     # Internal: tx (setpoint) loop
