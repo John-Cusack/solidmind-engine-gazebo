@@ -47,6 +47,18 @@ _ROTOR_DRAG_COEFFICIENT = "8.06428e-05"
 _ROLLING_MOMENT_COEFFICIENT = "1e-06"
 _ROTOR_VELOCITY_SLOWDOWN_SIM = "10"
 
+# Fallback inertial for a manifest link that declares no mass.
+#
+# There is no such thing as an SDF link with no inertia: omitting ``<inertial>``
+# selects the spec defaults, which are mass 1.0 kg and ixx=iyy=izz=1.0 kg·m²
+# (``/usr/share/sdformat/1.10/inertial.sdf``).  On a 1.4 kg quadrotor that
+# default is a phantom body two thirds the vehicle's mass and sixty times its
+# roll inertia — enough to saturate every motor and tumble it seconds after
+# takeoff, which is exactly what it did.  So we always emit the element, and
+# when the manifest is silent we say "negligible" out loud instead.
+_MASSLESS_LINK_MASS_KG = 1e-6
+_MASSLESS_LINK_INERTIA = {"ixx": 1e-9, "iyy": 1e-9, "izz": 1e-9}
+
 
 class SdfCompileError(Exception):
     """Raised when a package cannot be compiled into SDF."""
@@ -203,11 +215,13 @@ def _emit_primitive_visual(link_el: ET.Element, name: str, collision: dict[str, 
 
 def _emit_inertial(link_el: ET.Element, link: dict[str, Any]) -> None:
     mass = link.get("mass_kg")
+    tensor = link.get("inertia")
     if mass is None:
-        return
+        # Never return early here — see _MASSLESS_LINK_MASS_KG.
+        mass = _MASSLESS_LINK_MASS_KG
+        tensor = tensor or _MASSLESS_LINK_INERTIA
     inertial = ET.SubElement(link_el, "inertial")
     ET.SubElement(inertial, "mass").text = _fmt(float(mass))
-    tensor = link.get("inertia")
     if tensor:
         inertia = ET.SubElement(inertial, "inertia")
         for key in ("ixx", "ixy", "ixz", "iyy", "iyz", "izz"):
@@ -534,6 +548,20 @@ def validate_sdf(path: str, *, drone_mode: bool = False) -> list[dict[str, Any]]
         return [_finding("sdf.links_missing", "block", "SDF model has no <link> elements.")]
 
     link_names = {lk.attrib.get("name", "") for lk in links}
+
+    for lel in links:
+        if lel.find("inertial") is None:
+            lname = lel.attrib.get("name", "?")
+            findings.append(
+                _finding(
+                    "sdf.missing_inertial",
+                    "warn",
+                    f"Link '{lname}' has no <inertial> — SDF will give it the "
+                    "spec default of 1 kg and unit inertia, not zero.",
+                    field=f"link/{lname}/inertial",
+                )
+            )
+
     if len(links) > 1 and not joints:
         findings.append(
             _finding("sdf.joints_missing", "warn", "Model has multiple links but no joints.")

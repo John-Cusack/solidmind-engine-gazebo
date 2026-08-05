@@ -142,6 +142,9 @@ class MavlinkController:
         self._ack_events: dict[int, tuple[threading.Event, list[int]]] = {}
         self._ack_lock = threading.Lock()
 
+        self._param_events: dict[str, tuple[threading.Event, list[float]]] = {}
+        self._param_lock = threading.Lock()
+
     # ------------------------------------------------------------------
     # Connection lifecycle
     # ------------------------------------------------------------------
@@ -274,14 +277,21 @@ class MavlinkController:
             description="disarm",
         )
 
-    def takeoff_via_mode(self, timeout_s: float = 5.0) -> None:
+    def takeoff_via_mode(self, altitude_m: float | None = None, timeout_s: float = 5.0) -> None:
         """Trigger AUTO_TAKEOFF mode — same code path as ``commander takeoff``.
 
         PX4 v1.17 ignores the older MAV_CMD_NAV_TAKEOFF flow without first
         being switched to AUTO_TAKEOFF mode.  This helper does exactly that:
         ``DO_SET_MODE`` to (custom_main=4, custom_sub=2).  Vehicle must
         already be armed.
+
+        AUTO_TAKEOFF carries no altitude of its own — with no mission item to
+        read, PX4 climbs to ``MIS_TAKEOFF_ALT`` and logs "Using default takeoff
+        altitude: 2.50 m".  So ``altitude_m`` is applied by setting that
+        parameter first; without it, asking for 5 m silently gets you 2.5.
         """
+        if altitude_m is not None:
+            self.set_param("MIS_TAKEOFF_ALT", float(altitude_m), timeout_s=timeout_s)
         self._send_command_long_and_wait(
             command=176,  # MAV_CMD_DO_SET_MODE
             param1=1.0,  # MAV_MODE_FLAG_CUSTOM_MODE_ENABLED
@@ -290,6 +300,45 @@ class MavlinkController:
             timeout_s=timeout_s,
             description="set AUTO_TAKEOFF mode",
         )
+
+    def set_param(self, name: str, value: float, timeout_s: float = 5.0) -> float:
+        """Set a PX4 parameter and wait for the readback.
+
+        PARAM_SET is not acknowledged by COMMAND_ACK — PX4 replies with a
+        PARAM_VALUE carrying whatever it actually stored, which may differ from
+        what was asked (clamped to the parameter's range, or rounded for an
+        integer parameter).  Returning the stored value rather than the
+        requested one keeps callers honest about that.
+        """
+        if self._conn is None:
+            raise MavlinkError(
+                f"Cannot set {name!r} — not connected.",
+                code="NOT_CONNECTED",
+            )
+
+        event = threading.Event()
+        values: list[float] = []
+        with self._param_lock:
+            self._param_events[name] = (event, values)
+
+        try:
+            with self._mav_lock:
+                self._conn.mav.param_set_send(
+                    self._target_system,
+                    self._target_component,
+                    name.encode("ascii"),
+                    float(value),
+                    9,  # MAV_PARAM_TYPE_REAL32
+                )
+            if not event.wait(timeout=timeout_s):
+                raise MavlinkError(
+                    f"No PARAM_VALUE for {name!r} within {timeout_s}s",
+                    code="PARAM_TIMEOUT",
+                )
+            return values[0]
+        finally:
+            with self._param_lock:
+                self._param_events.pop(name, None)
 
     def land_via_mode(self, timeout_s: float = 5.0) -> None:
         """Trigger AUTO_LAND mode — same code path as ``commander land``."""
@@ -421,6 +470,21 @@ class MavlinkController:
                     float(msg.vy),
                     float(msg.vz),
                 )
+            return
+
+        if msg_type == "PARAM_VALUE":
+            # pymavlink usually decodes param_id, but not always — a char[16]
+            # field can arrive as NUL-padded bytes.
+            raw = msg.param_id
+            name = (raw.decode("ascii", "replace") if isinstance(raw, bytes) else str(raw)).rstrip(
+                "\x00"
+            )
+            with self._param_lock:
+                entry = self._param_events.get(name)
+            if entry is not None:
+                event, values = entry
+                values.append(float(msg.param_value))
+                event.set()
             return
 
         if msg_type == "COMMAND_ACK":

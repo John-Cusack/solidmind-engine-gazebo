@@ -186,6 +186,69 @@ class TestMavlinkControllerCommands(unittest.TestCase):
         self.assertEqual(args[5], 4.0)  # AUTO main mode
         self.assertEqual(args[6], 2.0)  # AUTO_TAKEOFF sub mode
 
+    def _param_value(self, name: str, value: float) -> None:
+        """Inject a PARAM_VALUE readback after a tiny delay."""
+
+        def deliver() -> None:
+            time.sleep(0.05)
+            self.fake.inject_message(
+                _FakeMessage("PARAM_VALUE", {"param_id": name, "param_value": value})
+            )
+
+        threading.Thread(target=deliver, daemon=True).start()
+
+    def test_set_param_returns_what_px4_actually_stored(self) -> None:
+        # PX4 may clamp or round; the readback is the truth, not the request.
+        self._param_value("MIS_TAKEOFF_ALT", 3.0)
+        stored = self.ctrl.set_param("MIS_TAKEOFF_ALT", 5.0, timeout_s=2.0)
+        self.assertEqual(stored, 3.0)
+        args = self.fake.mav.param_set_send.call_args.args
+        self.assertEqual(args[0], 1)  # target_system
+        self.assertEqual(args[2], b"MIS_TAKEOFF_ALT")
+        self.assertEqual(args[3], 5.0)
+
+    def test_set_param_matches_a_nul_padded_bytes_param_id(self) -> None:
+        """param_id is a char[16] — it can arrive as NUL-padded bytes."""
+
+        def deliver() -> None:
+            time.sleep(0.05)
+            self.fake.inject_message(
+                _FakeMessage(
+                    "PARAM_VALUE",
+                    {"param_id": b"MIS_TAKEOFF_ALT\x00", "param_value": 4.0},
+                )
+            )
+
+        threading.Thread(target=deliver, daemon=True).start()
+        self.assertEqual(self.ctrl.set_param("MIS_TAKEOFF_ALT", 4.0, timeout_s=2.0), 4.0)
+
+    def test_set_param_times_out_without_a_readback(self) -> None:
+        with self.assertRaises(MavlinkError) as cm:
+            self.ctrl.set_param("MIS_TAKEOFF_ALT", 5.0, timeout_s=0.1)
+        self.assertEqual(cm.exception.code, "PARAM_TIMEOUT")
+
+    def test_takeoff_altitude_is_applied_not_silently_dropped(self) -> None:
+        """AUTO_TAKEOFF has no altitude field — it reads MIS_TAKEOFF_ALT.
+
+        Without this, asking for 5 m climbs to PX4's 2.5 m default and the
+        pipeline's own altitude check is what discovers it.
+        """
+        self._param_value("MIS_TAKEOFF_ALT", 5.0)
+        self._ack(176)
+        self.ctrl.takeoff_via_mode(altitude_m=5.0, timeout_s=2.0)
+
+        self.fake.mav.param_set_send.assert_called_once()
+        args = self.fake.mav.param_set_send.call_args.args
+        self.assertEqual(args[2], b"MIS_TAKEOFF_ALT")
+        self.assertEqual(args[3], 5.0)
+        # And the mode switch still happened, after the parameter.
+        self.assertEqual(self.fake.mav.command_long_send.call_args.args[2], 176)
+
+    def test_takeoff_without_an_altitude_sets_no_parameter(self) -> None:
+        self._ack(176)
+        self.ctrl.takeoff_via_mode(timeout_s=2.0)
+        self.fake.mav.param_set_send.assert_not_called()
+
     def test_land_via_mode_switches_to_auto_land(self) -> None:
         self._ack(176)
         self.ctrl.land_via_mode(timeout_s=2.0)
