@@ -197,6 +197,32 @@ class TestMavlinkControllerCommands(unittest.TestCase):
 
         threading.Thread(target=deliver, daemon=True).start()
 
+    def _respond_to_sends(self, *, stored: float | None = None) -> None:
+        """Reply to PARAM_SET and COMMAND_LONG as they are sent.
+
+        A timer-based reply races any call that sends two messages in sequence:
+        the ACK for the second can land before its waiter is registered, and is
+        then dropped. Responding from the send itself removes the ordering
+        question entirely — the waiter is always registered before the send.
+        """
+
+        def on_param_set(_ts, _tc, name: bytes, value: float, _type: int) -> None:
+            self.fake.inject_message(
+                _FakeMessage(
+                    "PARAM_VALUE",
+                    {
+                        "param_id": name,
+                        "param_value": value if stored is None else stored,
+                    },
+                )
+            )
+
+        def on_command_long(_ts, _tc, command: int, *_args) -> None:
+            self.fake.inject_message(_FakeMessage("COMMAND_ACK", {"command": command, "result": 0}))
+
+        self.fake.mav.param_set_send.side_effect = on_param_set
+        self.fake.mav.command_long_send.side_effect = on_command_long
+
     def test_set_param_returns_what_px4_actually_stored(self) -> None:
         # PX4 may clamp or round; the readback is the truth, not the request.
         self._param_value("MIS_TAKEOFF_ALT", 3.0)
@@ -233,8 +259,7 @@ class TestMavlinkControllerCommands(unittest.TestCase):
         Without this, asking for 5 m climbs to PX4's 2.5 m default and the
         pipeline's own altitude check is what discovers it.
         """
-        self._param_value("MIS_TAKEOFF_ALT", 5.0)
-        self._ack(176)
+        self._respond_to_sends()
         self.ctrl.takeoff_via_mode(altitude_m=5.0, timeout_s=2.0)
 
         self.fake.mav.param_set_send.assert_called_once()
